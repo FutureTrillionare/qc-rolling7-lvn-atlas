@@ -1,6 +1,6 @@
 from AlgorithmImports import *
 from collections import deque
-from datetime import timedelta
+from datetime import timedelta, time, date
 import math
 import statistics
 import pandas as pd
@@ -10,8 +10,8 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
     def initialize(self):
         # ---- Backtest window (edit freely) ----
-        self.set_start_date(2024, 1, 2)
-        self.set_end_date(2024, 3, 1)
+        self.set_start_date(2024, 4, 1)
+        self.set_end_date(2024, 5, 1)
         self.set_cash(100000)
 
         # Use Chicago timezone since your sessions/MOR are based on it
@@ -71,7 +71,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
             Resolution.MINUTE,
             extended_market_hours=True,
             data_mapping_mode=DataMappingMode.OPEN_INTEREST,
-            data_normalization_mode=DataNormalizationMode.BACKWARDS_RATIO,
+            data_normalization_mode=DataNormalizationMode.RAW,
             contract_depth_offset=0
         )
         self.future.set_filter(0, 182)
@@ -137,6 +137,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.tp_ticket = None
         self.sl_ticket = None
         self.pending_bracket = None  # dict with stop/tp ticks
+        self.last_built_days_count = 0
 
     # ------------------------- Data handlers -------------------------
 
@@ -155,10 +156,10 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
         self.bar_index += 1
 
-        # Day boundary reset
-        d = self.time.date()
-        if self.today != d:
-            self.today = d
+        # Trading day boundary reset (Sunday >= 17:00 CT belongs to next day)
+        trading_day = self._trading_day_from_timestamp(self.time)
+        if self.today != trading_day:
+            self.today = trading_day
             self.trades_taken_today = 0
             self._reset_plan()
             self._cancel_all_open_orders()
@@ -167,9 +168,13 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.last30m_vols.append(float(bar.volume))
 
         # Rebuild rolling map once per day (first bar of day)
-        if self.map_built_for != d:
+        if self.map_built_for != trading_day:
             built = self._rebuild_rolling7_map()
-            self.map_built_for = d if built else None
+            self.map_built_for = trading_day if built else None
+            self.debug(
+                f"DAY trading_day={trading_day} built_days={self.last_built_days_count} "
+                f"polr_bias={self.polr_bias} boundary_tick={self.boundary_tick} map_built={built}"
+            )
 
         if self.polr_bias == 0 or self.boundary_tick == 0:
             return
@@ -186,34 +191,38 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
     def on_order_event(self, order_event: OrderEvent):
         # OCO bracket management
-        if self.entry_ticket and order_event.order_id == self.entry_ticket.order_id:
-            if order_event.status == OrderStatus.FILLED and self.pending_bracket:
-                sym = self.entry_ticket.symbol
+        if self.entry_ticket and order_event.OrderId == self.entry_ticket.OrderId:
+            if order_event.Status == OrderStatus.FILLED and self.pending_bracket:
+                sym = self.entry_ticket.Symbol
                 side = self.pending_bracket["side"]
                 stop_tick = self.pending_bracket["stop_tick"]
                 tp_tick = self.pending_bracket["tp_tick"]
 
-                qty = abs(self.entry_ticket.quantity)
+                qty = abs(self.entry_ticket.Quantity)
                 if side > 0:
-                    self.sl_ticket = self.stop_market_order(sym, -qty, stop_tick * self.tick_size, tag="SL")
+                    self.sl_ticket = self.stop_market_order(sym, -qty, stop_tick * self.tick_size, "SL")
                     if tp_tick:
-                        self.tp_ticket = self.limit_order(sym, -qty, tp_tick * self.tick_size, tag="TP")
+                        self.tp_ticket = self.limit_order(sym, -qty, tp_tick * self.tick_size, "TP")
                 else:
-                    self.sl_ticket = self.stop_market_order(sym, qty, stop_tick * self.tick_size, tag="SL")
+                    self.sl_ticket = self.stop_market_order(sym, qty, stop_tick * self.tick_size, "SL")
                     if tp_tick:
-                        self.tp_ticket = self.limit_order(sym, qty, tp_tick * self.tick_size, tag="TP")
+                        self.tp_ticket = self.limit_order(sym, qty, tp_tick * self.tick_size, "TP")
 
                 self.pending_bracket = None
+                self.debug(
+                    f"BRACKET ATTACHED entry_order_id={order_event.OrderId} side={side} "
+                    f"stop_tick={stop_tick} tp_tick={tp_tick}"
+                )
 
         # Cancel sibling when TP or SL fills
-        if self.tp_ticket and order_event.order_id == self.tp_ticket.order_id and order_event.status == OrderStatus.FILLED:
+        if self.tp_ticket and order_event.OrderId == self.tp_ticket.OrderId and order_event.Status == OrderStatus.FILLED:
             if self.sl_ticket:
-                self.transactions.cancel_order(self.sl_ticket.order_id, "OCO cancel SL")
+                self.transactions.cancel_order(self.sl_ticket.OrderId, "OCO cancel SL")
             self._clear_tickets()
 
-        if self.sl_ticket and order_event.order_id == self.sl_ticket.order_id and order_event.status == OrderStatus.FILLED:
+        if self.sl_ticket and order_event.OrderId == self.sl_ticket.OrderId and order_event.Status == OrderStatus.FILLED:
             if self.tp_ticket:
-                self.transactions.cancel_order(self.tp_ticket.order_id, "OCO cancel TP")
+                self.transactions.cancel_order(self.tp_ticket.OrderId, "OCO cancel TP")
             self._clear_tickets()
 
     def _on_5m(self, bar: TradeBar):
@@ -368,9 +377,9 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
         # Entry
         if entry_type == "LIMIT":
-            self.entry_ticket = self.limit_order(sym, qty, entry_tick * self.tick_size, tag=tag)
+            self.entry_ticket = self.limit_order(sym, qty, entry_tick * self.tick_size, tag)
         else:
-            self.entry_ticket = self.market_order(sym, qty, tag=tag)
+            self.entry_ticket = self.market_order(sym, qty, False, tag)
 
         # Store bracket to place on fill (OCO logic in OnOrderEvent)
         self.pending_bracket = {
@@ -378,7 +387,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
             "stop_tick": stop_tick,
             "tp_tick": tp_tick
         }
-        self.debug(f"ORDER {tag} entryType={entry_type} side={side} entry={entry_tick} stop={stop_tick} tp={tp_tick}")
+        self.debug(f"ORDER SUBMITTED {tag} entryType={entry_type} side={side} entry={entry_tick} stop={stop_tick} tp={tp_tick}")
 
     def _clear_tickets(self):
         self.entry_ticket = None
@@ -389,7 +398,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
     def _cancel_all_open_orders(self):
         for ticket in self.transactions.get_open_order_tickets():
-            self.transactions.cancel_order(ticket.order_id, "Daily reset cancel")
+            self.transactions.cancel_order(ticket.OrderId, "Daily reset cancel")
 
     def _history_frame_for_symbol(self, history_df, prefer_contains="MES"):
         if history_df is None or history_df.empty:
@@ -464,33 +473,43 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
             )
             return False
 
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.reset_index(level=0, drop=True, inplace=False)
+        normalized = df.reset_index()
+        cols_by_lower = {str(c).lower(): c for c in normalized.columns}
 
+        ts_col = cols_by_lower.get("time") or cols_by_lower.get("endtime")
+        close_col = cols_by_lower.get("close")
+        vol_col = cols_by_lower.get("volume")
+        if ts_col is None or close_col is None or vol_col is None:
+            self.debug(f"History normalized columns missing required fields: {list(normalized.columns)}")
+            return False
+
+        normalized[ts_col] = pd.to_datetime(normalized[ts_col], errors="coerce")
+        normalized = normalized.dropna(subset=[ts_col])
         df_is_multi = isinstance(df.index, pd.MultiIndex)
 
-        first_ts = df.index.min() if len(df.index) else None
-        last_ts = df.index.max() if len(df.index) else None
+        first_ts = normalized[ts_col].min() if len(normalized) else None
+        last_ts = normalized[ts_col].max() if len(normalized) else None
         self.debug(
             f"History diagnostics shape={history.shape} history_is_multi={history_is_multi} "
             f"df_is_multi={df_is_multi} keys={keys_preview} "
             f"after_reset_first={first_ts} after_reset_last={last_ts}"
         )
 
-        today = self.time.date()
+        today = self._trading_day_from_timestamp(self.time)
         by_day = {}
-        for idx, row in df.iterrows():
-            ts = idx[1] if isinstance(idx, tuple) else idx
-            d = ts.date()
+        for _, row in normalized.iterrows():
+            ts = row[ts_col]
+            d = self._trading_day_from_timestamp(ts)
             if d >= today:
                 continue
-            close_px = float(row["close"])
-            vol = float(row["volume"])
+            close_px = float(row[close_col])
+            vol = float(row[vol_col])
             tick = self._px_to_tick(close_px)
             by_day.setdefault(d, {})
             by_day[d][tick] = by_day[d].get(tick, 0.0) + vol
 
         days = sorted(by_day.keys())[-self.ROLLING_DAYS:]
+        self.last_built_days_count = len(days)
         if len(days) < self.ROLLING_DAYS:
             self.debug(f"Not enough completed days for rolling map: have {len(days)}")
             return False
@@ -518,8 +537,14 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self._build_friction_and_zones()
         self._compute_polr(current_px_tick=self._px_to_tick(self.securities[sym].price))
 
-        self.debug(f"REBUILD {today} compRange=[{self.comp_min_tick},{self.comp_max_tick}] POC={self.comp_poc_tick} shelves={len(self.hvn_shelves)} lanes={len(self.lvn_lanes)} bias={self.polr_bias} boundary={self.boundary_tick}")
+        self.debug(f"REBUILD trading_day={today} used_days={len(days)} compRange=[{self.comp_min_tick},{self.comp_max_tick}] POC={self.comp_poc_tick} shelves={len(self.hvn_shelves)} lanes={len(self.lvn_lanes)} bias={self.polr_bias} boundary={self.boundary_tick}")
         return True
+
+    def _trading_day_from_timestamp(self, ts) -> date:
+        d = ts.date()
+        if ts.weekday() == 6 and ts.time() >= time(17, 0):
+            return d + timedelta(days=1)
+        return d
 
     def _build_friction_and_zones(self):
         n = len(self.vol_dense)
