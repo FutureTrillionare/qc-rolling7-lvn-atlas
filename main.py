@@ -1,7 +1,6 @@
 from AlgorithmImports import *
 from collections import deque
-from datetime import timedelta, time, date
-import math
+from datetime import timedelta
 import statistics
 import pandas as pd
 
@@ -9,16 +8,21 @@ import pandas as pd
 class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
     def initialize(self):
-        # ---- Backtest window (edit freely) ----
+        # ---- Backtest window: April 2024 ----
         self.set_start_date(2024, 4, 1)
         self.set_end_date(2024, 5, 1)
         self.set_cash(100000)
 
-        # Use Chicago timezone since your sessions/MOR are based on it
+        # Chicago timezone (your session logic)
         self.set_time_zone(TimeZones.CHICAGO)
 
-        # ---- Strategy parameters (match your Sierra defaults) ----
+        # ---- Strategy parameters (match Sierra defaults) ----
         self.ROLLING_DAYS = 7
+
+        # Trade-day rollover: shift timestamps so Sun 17:00 CT -> Monday trade-date
+        # (5pm CT + 7h = midnight next day)
+        self.TRADE_DAY_ROLLOVER_HOURS = 7
+        self.MIN_DAY_COVERAGE_PCT = 0.50  # similar to Sierra (used only to filter very partial days)
 
         # LVN detection
         self.MIN_PROM = 0.25
@@ -54,7 +58,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.LANE_SPEED_BARS_HALF = 6
         self.S2_REQUIRE_POLR_ALIGN = True
 
-        # Session filter (match your defaults: allow LONDON + NYAM)
+        # Session filter (allow LONDON + NYAM)
         self.ENABLE_SESSION_FILTER = True
         self.ALLOW_ASIA = False
         self.ALLOW_LONDON = True
@@ -65,35 +69,34 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.MAX_TRADES_PER_DAY = 1
         self.QTY = 1
 
-        # ---- Futures subscription (MES) ----
+        # ---- Futures subscription (MES continuous) ----
         self.future = self.add_future(
             Futures.Indices.MICRO_SP_500_E_MINI,
             Resolution.MINUTE,
             extended_market_hours=True,
             data_mapping_mode=DataMappingMode.OPEN_INTEREST,
-            data_normalization_mode=DataNormalizationMode.RAW,
+            data_normalization_mode=DataNormalizationMode.BACKWARDS_RATIO,
             contract_depth_offset=0
         )
         self.future.set_filter(0, 182)
-        self.settings.seed_initial_prices = True  # lets you trade right after subscription
+        self.settings.seed_initial_prices = True
 
-        # Tick size for MES is 0.25 index points
-        # (QC SymbolProperties also contains this, but we keep it explicit)
         self.tick_size = 0.25
 
         # ---- State ----
-        self.today = None
+        self.today_trade_date = None
         self.trades_taken_today = 0
 
-        # Rolling map state (rebuilt daily)
+        # Rolling map state (rebuilt once per trade-day)
+        self.map_attempted_for = None
         self.map_built_for = None
         self.comp_min_tick = 0
         self.comp_max_tick = 0
         self.comp_poc_tick = 0
         self.vol_dense = []
         self.friction = []
-        self.hvn_shelves = []  # list of (loTick, hiTick)
-        self.lvn_lanes = []    # list of (loTick, hiTick)
+        self.hvn_shelves = []
+        self.lvn_lanes = []
 
         # PoLR state
         self.polr_bias = 0  # 0 neutral, +1 up, -1 down
@@ -101,7 +104,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.score_up = 0.0
         self.score_dn = 0.0
         self.boundary_tick = 0
-        self.boundary_type = 0  # 1 HVN_TOP,2 HVN_BOTTOM,3 LANE_TOP,4 LANE_BOTTOM
+        self.boundary_type = 0
 
         # Plan state
         self.plan_active = False
@@ -119,7 +122,6 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.lane_tracking_enter_bar = None
         self.lane_tracking_enter_side = 0
 
-        # Bar counter (minute bars)
         self.bar_index = 0
 
         # ATR indicators (5m and 60m)
@@ -132,34 +134,42 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         # Volume median last 30m
         self.last30m_vols = deque(maxlen=30)
 
-        # Order tickets (OCO bracket)
+        # Order tickets (bracket on fill)
         self.entry_ticket = None
         self.tp_ticket = None
         self.sl_ticket = None
-        self.pending_bracket = None  # dict with stop/tp ticks
-        self.last_built_days_count = 0
+        self.pending_bracket = None
+
+    # ------------------------- Time helpers -------------------------
+
+    def _trade_date(self, ts) -> object:
+        # ts can be QC datetime, python datetime, or pandas Timestamp
+        try:
+            if isinstance(ts, pd.Timestamp):
+                ts = ts.to_pydatetime()
+        except Exception:
+            pass
+        return (ts + timedelta(hours=self.TRADE_DAY_ROLLOVER_HOURS)).date()
 
     # ------------------------- Data handlers -------------------------
 
     def on_data(self, data: Slice):
-        # Use the currently mapped contract for trading
         sym = self.future.mapped
         if sym is None:
             return
 
         bar = data.bars.get(sym, None)
         if bar is None:
-            # Sometimes only continuous updates; try continuous as fallback
             bar = data.bars.get(self.future.symbol, None)
             if bar is None:
                 return
 
         self.bar_index += 1
 
-        # Trading day boundary reset (Sunday >= 17:00 CT belongs to next day)
-        trading_day = self._trading_day_from_timestamp(self.time)
-        if self.today != trading_day:
-            self.today = trading_day
+        # Trade-day reset (Sunday night joins Monday)
+        td = self._trade_date(self.time)
+        if self.today_trade_date != td:
+            self.today_trade_date = td
             self.trades_taken_today = 0
             self._reset_plan()
             self._cancel_all_open_orders()
@@ -167,14 +177,11 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         # Track volume window for S1 participation
         self.last30m_vols.append(float(bar.volume))
 
-        # Rebuild rolling map once per day (first bar of day)
-        if self.map_built_for != trading_day:
+        # Rebuild rolling map once per trade-day (attempt only once to prevent spam)
+        if self.map_attempted_for != td:
+            self.map_attempted_for = td
             built = self._rebuild_rolling7_map()
-            self.map_built_for = trading_day if built else None
-            self.debug(
-                f"DAY trading_day={trading_day} built_days={self.last_built_days_count} "
-                f"polr_bias={self.polr_bias} boundary_tick={self.boundary_tick} map_built={built}"
-            )
+            self.map_built_for = td if built else None
 
         if self.polr_bias == 0 or self.boundary_tick == 0:
             return
@@ -183,46 +190,37 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         high_tick = self._px_to_tick(bar.high)
         low_tick = self._px_to_tick(bar.low)
 
-        # Try create plan (S1 / S2)
         self._try_create_plan(close_tick, high_tick, low_tick)
-
-        # Execute plan (submit orders)
         self._execute_engine(close_tick, high_tick, low_tick, sym)
 
     def on_order_event(self, order_event: OrderEvent):
-        # OCO bracket management
-        if self.entry_ticket and order_event.OrderId == self.entry_ticket.OrderId:
-            if order_event.Status == OrderStatus.FILLED and self.pending_bracket:
-                sym = self.entry_ticket.Symbol
+        if self.entry_ticket and order_event.order_id == self.entry_ticket.order_id:
+            if order_event.status == OrderStatus.FILLED and self.pending_bracket:
+                sym = self.entry_ticket.symbol
                 side = self.pending_bracket["side"]
                 stop_tick = self.pending_bracket["stop_tick"]
                 tp_tick = self.pending_bracket["tp_tick"]
+                qty = abs(self.entry_ticket.quantity)
 
-                qty = abs(self.entry_ticket.Quantity)
                 if side > 0:
-                    self.sl_ticket = self.stop_market_order(sym, -qty, stop_tick * self.tick_size, "SL")
+                    self.sl_ticket = self.stop_market_order(sym, -qty, stop_tick * self.tick_size)
                     if tp_tick:
-                        self.tp_ticket = self.limit_order(sym, -qty, tp_tick * self.tick_size, "TP")
+                        self.tp_ticket = self.limit_order(sym, -qty, tp_tick * self.tick_size)
                 else:
-                    self.sl_ticket = self.stop_market_order(sym, qty, stop_tick * self.tick_size, "SL")
+                    self.sl_ticket = self.stop_market_order(sym, qty, stop_tick * self.tick_size)
                     if tp_tick:
-                        self.tp_ticket = self.limit_order(sym, qty, tp_tick * self.tick_size, "TP")
+                        self.tp_ticket = self.limit_order(sym, qty, tp_tick * self.tick_size)
 
                 self.pending_bracket = None
-                self.debug(
-                    f"BRACKET ATTACHED entry_order_id={order_event.OrderId} side={side} "
-                    f"stop_tick={stop_tick} tp_tick={tp_tick}"
-                )
 
-        # Cancel sibling when TP or SL fills
-        if self.tp_ticket and order_event.OrderId == self.tp_ticket.OrderId and order_event.Status == OrderStatus.FILLED:
+        if self.tp_ticket and order_event.order_id == self.tp_ticket.order_id and order_event.status == OrderStatus.FILLED:
             if self.sl_ticket:
-                self.transactions.cancel_order(self.sl_ticket.OrderId, "OCO cancel SL")
+                self.transactions.cancel_order(self.sl_ticket.order_id, "OCO cancel SL")
             self._clear_tickets()
 
-        if self.sl_ticket and order_event.OrderId == self.sl_ticket.OrderId and order_event.Status == OrderStatus.FILLED:
+        if self.sl_ticket and order_event.order_id == self.sl_ticket.order_id and order_event.status == OrderStatus.FILLED:
             if self.tp_ticket:
-                self.transactions.cancel_order(self.tp_ticket.OrderId, "OCO cancel TP")
+                self.transactions.cancel_order(self.tp_ticket.order_id, "OCO cancel TP")
             self._clear_tickets()
 
     def _on_5m(self, bar: TradeBar):
@@ -234,12 +232,9 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
     # ------------------------- Engine logic -------------------------
 
     def _try_create_plan(self, close_tick: int, high_tick: int, low_tick: int):
-        # Don’t create new plans if we already have one active
         if self.plan_active:
-            # Lane tracking reset if we leave lane
             return
 
-        # Need indicators ready
         if not (self.atr5.is_ready and self.atr60.is_ready):
             return
 
@@ -251,8 +246,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
         bar_range_ticks = max(0, high_tick - low_tick)
 
-        # ---- Style 1 (breakout + displacement + participation) ----
-        close_break = False
+        # ---- Style 1 ----
         if self.polr_bias > 0:
             close_break = close_tick >= (self.boundary_tick + self.BREAKOUT_CLOSE_TICKS)
         else:
@@ -269,16 +263,14 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
             self.plan_entry_tick = (self.boundary_tick + self.FRONT_RUN) if self.polr_bias > 0 else (self.boundary_tick - self.FRONT_RUN)
             self.plan_stop_tick = (self.boundary_tick - self.PLAN_STOP_BUF) if self.polr_bias > 0 else (self.boundary_tick + self.PLAN_STOP_BUF)
-
-            # TP1: next shelf beyond entry (simple)
             self.plan_tp1_tick = self._next_target_tick(self.plan_entry_tick, self.plan_bias)
 
             self.plan_created_time = self.time
             self.plan_submitted = False
-            self.debug(f"S1 PLAN {self.today} bias={self.plan_bias} boundary={self.boundary_tick} entry={self.plan_entry_tick} stop={self.plan_stop_tick} tp={self.plan_tp1_tick}")
+            self.debug(f"S1 PLAN td={self.today_trade_date} bias={self.plan_bias} boundary={self.boundary_tick} entry={self.plan_entry_tick} stop={self.plan_stop_tick} tp={self.plan_tp1_tick}")
             return
 
-        # ---- Style 2 (lane mid-cross fast) ----
+        # ---- Style 2 ----
         lane_idx = self._lane_index_containing(close_tick)
         if lane_idx is None:
             self.lane_tracking_idx = None
@@ -288,13 +280,10 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
             self.lane_tracking_idx = lane_idx
             self.lane_tracking_enter_bar = self.bar_index
             lo, hi = self.lvn_lanes[lane_idx]
-            # enter side: -1 from above, +1 from below
-            prev_close = close_tick
             self.lane_tracking_enter_side = 0
-            # we can only infer side using current bar location; good enough for this QC test
-            if prev_close < lo:
+            if close_tick < lo:
                 self.lane_tracking_enter_side = -1
-            elif prev_close > hi:
+            elif close_tick > hi:
                 self.lane_tracking_enter_side = 1
 
         lo, hi = self.lvn_lanes[lane_idx]
@@ -319,7 +308,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
         self.plan_created_time = self.time
         self.plan_submitted = False
-        self.debug(f"S2 PLAN {self.today} bias={self.plan_bias} lane=[{lo},{hi}] mid={mid} entry={self.plan_entry_tick} stop={self.plan_stop_tick} tp={self.plan_tp1_tick}")
+        self.debug(f"S2 PLAN td={self.today_trade_date} bias={self.plan_bias} lane=[{lo},{hi}] mid={mid} entry={self.plan_entry_tick} stop={self.plan_stop_tick} tp={self.plan_tp1_tick}")
 
     def _execute_engine(self, close_tick: int, high_tick: int, low_tick: int, sym: Symbol):
         if self.trades_taken_today >= self.MAX_TRADES_PER_DAY:
@@ -333,15 +322,12 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
         side = 1 if self.plan_bias > 0 else -1
 
-        # S1: wait for retest of entry within timeout
         if self.plan_style == 1:
             mins_since = (self.time - self.plan_created_time).total_seconds() / 60.0
             if mins_since > self.S1_RETEST_TIMEOUT_MIN:
                 self.debug("S1 TIMEOUT cancel plan")
                 self._reset_plan()
                 return
-
-            # Must be at least 1 minute after creation (matches your Sierra minsSince>=1.0)
             if mins_since < 1.0:
                 return
 
@@ -354,7 +340,6 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
             self.trades_taken_today += 1
             return
 
-        # S2: market if within 2 ticks else limit
         if self.plan_style == 2:
             if self.S2_REQUIRE_POLR_ALIGN:
                 if side > 0 and self.polr_bias <= 0:
@@ -372,22 +357,16 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
     # ------------------------- Order helpers -------------------------
 
     def _submit_bracket(self, sym: Symbol, side: int, entry_type: str, entry_tick: int, stop_tick: int, tp_tick: int, tag: str):
-        sym = self.future.mapped if self.future.mapped else sym
+        trade_sym = self.future.mapped if self.future.mapped else sym
         qty = self.QTY if side > 0 else -self.QTY
 
-        # Entry
         if entry_type == "LIMIT":
-            self.entry_ticket = self.limit_order(sym, qty, entry_tick * self.tick_size, tag)
+            self.entry_ticket = self.limit_order(trade_sym, qty, entry_tick * self.tick_size)
         else:
-            self.entry_ticket = self.market_order(sym, qty, False, tag)
+            self.entry_ticket = self.market_order(trade_sym, qty)
 
-        # Store bracket to place on fill (OCO logic in OnOrderEvent)
-        self.pending_bracket = {
-            "side": side,
-            "stop_tick": stop_tick,
-            "tp_tick": tp_tick
-        }
-        self.debug(f"ORDER SUBMITTED {tag} entryType={entry_type} side={side} entry={entry_tick} stop={stop_tick} tp={tp_tick}")
+        self.pending_bracket = {"side": side, "stop_tick": stop_tick, "tp_tick": tp_tick, "tag": tag}
+        self.debug(f"ORDER {tag} entryType={entry_type} side={side} entry={entry_tick} stop={stop_tick} tp={tp_tick}")
 
     def _clear_tickets(self):
         self.entry_ticket = None
@@ -398,123 +377,90 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
     def _cancel_all_open_orders(self):
         for ticket in self.transactions.get_open_order_tickets():
-            self.transactions.cancel_order(ticket.OrderId, "Daily reset cancel")
-
-    def _history_frame_for_symbol(self, history_df, prefer_contains="MES"):
-        if history_df is None or history_df.empty:
-            return None
-
-        index = history_df.index
-        if not isinstance(index, pd.MultiIndex):
-            return history_df
-
-        level_names = list(index.names)
-        symbol_level = 0
-        for i, name in enumerate(level_names):
-            if name and "symbol" in str(name).lower():
-                symbol_level = i
-                break
-
-        try:
-            keys = list(index.get_level_values(symbol_level).unique())
-        except Exception as ex:
-            self.debug(f"History MultiIndex key extraction failed: {ex}")
-            return None
-
-        if not keys:
-            self.debug("History MultiIndex had no symbol keys")
-            return None
-
-        selected_key = None
-        prefer_upper = str(prefer_contains).upper()
-        for key in keys:
-            if prefer_upper in str(key).upper():
-                selected_key = key
-                break
-
-        if selected_key is None:
-            selected_key = keys[0]
-
-        try:
-            return history_df.xs(selected_key, level=symbol_level)
-        except Exception as ex:
-            keys_preview = [str(k) for k in keys[:5]]
-            self.debug(
-                f"History slice failed key={selected_key} level={symbol_level} "
-                f"available_keys={keys_preview} err={ex}"
-            )
-            return None
+            self.transactions.cancel_order(ticket.order_id, "Daily reset cancel")
 
     # ------------------------- Map rebuild (rolling 7) -------------------------
 
     def _rebuild_rolling7_map(self) -> bool:
-        # Pull ~8 days of minute bars and build 7 completed days composite
-        sym = self.future.symbol  # use continuous for stability across rolls
-        history = self.history(sym, timedelta(days=self.ROLLING_DAYS + 1), Resolution.MINUTE)
-        if history.empty:
-            self.debug("No history returned for rebuild (data plan?)")
+        # extra buffer to survive weekends/partials
+        lookback_days = self.ROLLING_DAYS + 7
+
+        sym = self.future.symbol
+        history = self.history(sym, timedelta(days=lookback_days), Resolution.MINUTE)
+        if history is None or history.empty:
+            self.debug("No history returned for rebuild")
             return False
 
-        history_is_multi = isinstance(history.index, pd.MultiIndex)
-        keys_preview = []
-        if history_is_multi:
+        df = history
+
+        # Slice MultiIndex by symbol if present
+        if isinstance(df.index, pd.MultiIndex):
+            names = [str(n).lower() if n else "" for n in df.index.names]
+            level = None
+            for i, n in enumerate(names):
+                if "symbol" in n:
+                    level = i
+                    break
+            if level is None:
+                level = 0
+
             try:
-                keys_preview = [str(k) for k in history.index.get_level_values(0).unique()[:5]]
+                df = df.xs(sym, level=level)
             except Exception:
-                keys_preview = []
+                # fallback: take first key at that level
+                try:
+                    first_key = df.index.get_level_values(level).unique()[0]
+                    df = df.xs(first_key, level=level)
+                except Exception as ex:
+                    self.debug(f"History xs slice failed: {ex}")
+                    return False
 
-        # Collect by date (completed days only)
-        # History df index: (symbol, time) multiindex in QC
-        df = self._history_frame_for_symbol(history, prefer_contains="MES")
-        if df is None or df.empty:
-            self.debug(
-                f"History selection failed shape={history.shape} is_multi={history_is_multi} "
-                f"keys={keys_preview}"
-            )
-            return False
+        # Force DatetimeIndex
+        if isinstance(df.index, pd.MultiIndex):
+            try:
+                df = df.copy()
+                df.index = pd.to_datetime(df.index.get_level_values(-1))
+            except Exception as ex:
+                self.debug(f"History index normalize failed: {ex}")
+                return False
 
-        normalized = df.reset_index()
-        cols_by_lower = {str(c).lower(): c for c in normalized.columns}
+        if not isinstance(df.index, (pd.DatetimeIndex,)):
+            try:
+                df = df.copy()
+                df.index = pd.to_datetime(df.index)
+            except Exception as ex:
+                self.debug(f"History datetime conversion failed: {ex}")
+                return False
 
-        ts_col = cols_by_lower.get("time") or cols_by_lower.get("endtime")
-        close_col = cols_by_lower.get("close")
-        vol_col = cols_by_lower.get("volume")
-        if ts_col is None or close_col is None or vol_col is None:
-            self.debug(f"History normalized columns missing required fields: {list(normalized.columns)}")
-            return False
+        today_td = self._trade_date(self.time)
 
-        normalized[ts_col] = pd.to_datetime(normalized[ts_col], errors="coerce")
-        normalized = normalized.dropna(subset=[ts_col])
-        df_is_multi = isinstance(df.index, pd.MultiIndex)
-
-        first_ts = normalized[ts_col].min() if len(normalized) else None
-        last_ts = normalized[ts_col].max() if len(normalized) else None
-        self.debug(
-            f"History diagnostics shape={history.shape} history_is_multi={history_is_multi} "
-            f"df_is_multi={df_is_multi} keys={keys_preview} "
-            f"after_reset_first={first_ts} after_reset_last={last_ts}"
-        )
-
-        today = self._trading_day_from_timestamp(self.time)
         by_day = {}
-        for _, row in normalized.iterrows():
-            ts = row[ts_col]
-            d = self._trading_day_from_timestamp(ts)
-            if d >= today:
-                continue
-            close_px = float(row[close_col])
-            vol = float(row[vol_col])
-            tick = self._px_to_tick(close_px)
-            by_day.setdefault(d, {})
-            by_day[d][tick] = by_day[d].get(tick, 0.0) + vol
+        coverage = {}
 
-        days = sorted(by_day.keys())[-self.ROLLING_DAYS:]
-        self.last_built_days_count = len(days)
+        for ts, row in df.iterrows():
+            td = self._trade_date(ts)
+            if td >= today_td:
+                continue
+
+            coverage[td] = coverage.get(td, 0) + 1
+
+            close_px = float(row["close"])
+            vol = float(row["volume"])
+            if vol <= 0:
+                continue
+
+            tick = self._px_to_tick(close_px)
+            by_day.setdefault(td, {})
+            by_day[td][tick] = by_day[td].get(tick, 0.0) + vol
+
+        min_cov = int(1440 * self.MIN_DAY_COVERAGE_PCT)
+        completed_days = [d for d in sorted(by_day.keys()) if coverage.get(d, 0) >= min_cov]
+
+        days = completed_days[-self.ROLLING_DAYS:]
         if len(days) < self.ROLLING_DAYS:
-            self.debug(f"Not enough completed days for rolling map: have {len(days)}")
+            self.debug(f"Not enough completed trade-days for rolling map: have {len(days)} need {self.ROLLING_DAYS}")
             return False
 
-        # Composite histogram
         comp = {}
         for d in days:
             for tick, vol in by_day[d].items():
@@ -530,21 +476,21 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         for i in range(n):
             self.vol_dense[i] = comp.get(self.comp_min_tick + i, 0.0)
 
-        # Composite POC
         self.comp_poc_tick = self.comp_min_tick + max(range(n), key=lambda i: self.vol_dense[i])
 
-        # Build friction + zones + PoLR
         self._build_friction_and_zones()
-        self._compute_polr(current_px_tick=self._px_to_tick(self.securities[sym].price))
 
-        self.debug(f"REBUILD trading_day={today} used_days={len(days)} compRange=[{self.comp_min_tick},{self.comp_max_tick}] POC={self.comp_poc_tick} shelves={len(self.hvn_shelves)} lanes={len(self.lvn_lanes)} bias={self.polr_bias} boundary={self.boundary_tick}")
+        # current price tick for PoLR
+        px = None
+        if self.future.mapped and self.securities.contains_key(self.future.mapped):
+            px = self.securities[self.future.mapped].price
+        if px is None or px == 0:
+            px = self.securities[sym].price
+
+        self._compute_polr(current_px_tick=self._px_to_tick(px))
+
+        self.debug(f"REBUILD td={today_td} used_days=[{days[0]}..{days[-1]}] comp=[{self.comp_min_tick},{self.comp_max_tick}] POC={self.comp_poc_tick} shelves={len(self.hvn_shelves)} lanes={len(self.lvn_lanes)} bias={self.polr_bias} boundary={self.boundary_tick}")
         return True
-
-    def _trading_day_from_timestamp(self, ts) -> date:
-        d = ts.date()
-        if ts.weekday() == 6 and ts.time() >= time(17, 0):
-            return d + timedelta(days=1)
-        return d
 
     def _build_friction_and_zones(self):
         n = len(self.vol_dense)
@@ -567,11 +513,9 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         denom = max(1, n - 1)
         self.friction = [0.0] * n
         for i in range(n):
-            # rank as lower_bound / (n-1)
             r = self._lower_bound(tmp, vs[i])
             self.friction[i] = float(r) / float(denom)
 
-        # shelves and lanes
         shelves = []
         lanes = []
 
@@ -661,22 +605,17 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         elif (self.score_dn - self.score_up) > self.POLR_BIAS_THRESH:
             self.polr_bias = -1
 
-        # boundary selection (nearest HVN or lane boundary in bias direction)
         if self.polr_bias > 0:
             hvn_cand = None
             lane_cand = None
-
             for lo, hi in self.hvn_shelves:
                 if hi <= current_px_tick:
                     continue
                 hvn_cand = hi if (hvn_cand is None or (hi - current_px_tick) < (hvn_cand - current_px_tick)) else hvn_cand
-
             for lo, hi in self.lvn_lanes:
                 if hi <= current_px_tick:
                     continue
                 lane_cand = hi if (lane_cand is None or (hi - current_px_tick) < (lane_cand - current_px_tick)) else lane_cand
-
-            # pick nearest
             if hvn_cand is not None and (lane_cand is None or (hvn_cand - current_px_tick) <= (lane_cand - current_px_tick)):
                 self.boundary_tick = hvn_cand
                 self.boundary_type = 1
@@ -687,17 +626,14 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         elif self.polr_bias < 0:
             hvn_cand = None
             lane_cand = None
-
             for lo, hi in self.hvn_shelves:
                 if lo >= current_px_tick:
                     continue
                 hvn_cand = lo if (hvn_cand is None or (current_px_tick - lo) < (current_px_tick - hvn_cand)) else hvn_cand
-
             for lo, hi in self.lvn_lanes:
                 if lo >= current_px_tick:
                     continue
                 lane_cand = lo if (lane_cand is None or (current_px_tick - lo) < (current_px_tick - lane_cand)) else lane_cand
-
             if hvn_cand is not None and (lane_cand is None or (current_px_tick - hvn_cand) <= (current_px_tick - lane_cand)):
                 self.boundary_tick = hvn_cand
                 self.boundary_type = 2
@@ -719,7 +655,6 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         if not self.ENABLE_SESSION_FILTER:
             return True
         m = self.time.hour * 60 + self.time.minute
-        # your session buckets
         if m >= 1080 or m <= 119:
             return self.ALLOW_ASIA
         if 120 <= m <= 509:
@@ -751,7 +686,6 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         return None
 
     def _next_target_tick(self, from_tick: int, bias: int) -> int:
-        # Simple TP: next HVN shelf boundary in direction of bias
         if bias > 0:
             candidates = [lo for (lo, hi) in self.hvn_shelves if lo > from_tick]
             return (min(candidates) - self.FRONT_RUN) if candidates else 0
@@ -780,7 +714,6 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         return c
 
     def _lower_bound(self, arr, x):
-        # first idx where arr[idx] >= x
         lo, hi = 0, len(arr)
         while lo < hi:
             mid = (lo + hi) // 2
