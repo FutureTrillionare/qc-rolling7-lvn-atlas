@@ -67,7 +67,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
         # ---- Futures subscription (MES) ----
         self.future = self.add_future(
-            Futures.Indices.MicroSP500EMini,
+            Futures.Indices.MICRO_SP_500_E_MINI,
             Resolution.MINUTE,
             extended_market_hours=True,
             data_mapping_mode=DataMappingMode.OPEN_INTEREST,
@@ -195,13 +195,13 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
 
                 qty = abs(self.entry_ticket.quantity)
                 if side > 0:
-                    self.sl_ticket = self.stop_market_order(sym, -qty, stop_tick * self.tick_size, "SL")
+                    self.sl_ticket = self.stop_market_order(sym, -qty, stop_tick * self.tick_size, tag="SL")
                     if tp_tick:
-                        self.tp_ticket = self.limit_order(sym, -qty, tp_tick * self.tick_size, "TP")
+                        self.tp_ticket = self.limit_order(sym, -qty, tp_tick * self.tick_size, tag="TP")
                 else:
-                    self.sl_ticket = self.stop_market_order(sym, qty, stop_tick * self.tick_size, "SL")
+                    self.sl_ticket = self.stop_market_order(sym, qty, stop_tick * self.tick_size, tag="SL")
                     if tp_tick:
-                        self.tp_ticket = self.limit_order(sym, qty, tp_tick * self.tick_size, "TP")
+                        self.tp_ticket = self.limit_order(sym, qty, tp_tick * self.tick_size, tag="TP")
 
                 self.pending_bracket = None
 
@@ -363,13 +363,14 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
     # ------------------------- Order helpers -------------------------
 
     def _submit_bracket(self, sym: Symbol, side: int, entry_type: str, entry_tick: int, stop_tick: int, tp_tick: int, tag: str):
+        sym = self.future.mapped if self.future.mapped else sym
         qty = self.QTY if side > 0 else -self.QTY
 
         # Entry
         if entry_type == "LIMIT":
-            self.entry_ticket = self.limit_order(sym, qty, entry_tick * self.tick_size, tag)
+            self.entry_ticket = self.limit_order(sym, qty, entry_tick * self.tick_size, tag=tag)
         else:
-            self.entry_ticket = self.market_order(sym, qty, tag)
+            self.entry_ticket = self.market_order(sym, qty, tag=tag)
 
         # Store bracket to place on fill (OCO logic in OnOrderEvent)
         self.pending_bracket = {
@@ -473,7 +474,7 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         self.debug(
             f"History diagnostics shape={history.shape} history_is_multi={history_is_multi} "
             f"df_is_multi={df_is_multi} keys={keys_preview} "
-            f"slice_first={first_ts} slice_last={last_ts}"
+            f"after_reset_first={first_ts} after_reset_last={last_ts}"
         )
 
         today = self.time.date()
