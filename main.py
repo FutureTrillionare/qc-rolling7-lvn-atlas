@@ -143,13 +143,15 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
     def on_data(self, data: Slice):
         # Use the currently mapped contract for trading
         sym = self.future.mapped
+        if sym is None:
+            return
+
         bar = data.bars.get(sym, None)
         if bar is None:
             # Sometimes only continuous updates; try continuous as fallback
             bar = data.bars.get(self.future.symbol, None)
             if bar is None:
                 return
-            sym = self.future.symbol
 
         self.bar_index += 1
 
@@ -443,9 +445,9 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
             self.debug("No history returned for rebuild (data plan?)")
             return False
 
-        is_multi = isinstance(history.index, pd.MultiIndex)
+        history_is_multi = isinstance(history.index, pd.MultiIndex)
         keys_preview = []
-        if is_multi:
+        if history_is_multi:
             try:
                 keys_preview = [str(k) for k in history.index.get_level_values(0).unique()[:5]]
             except Exception:
@@ -456,22 +458,29 @@ class Rolling7LVNAtlasMES_QC(QCAlgorithm):
         df = self._history_frame_for_symbol(history, prefer_contains="MES")
         if df is None or df.empty:
             self.debug(
-                f"History selection failed shape={history.shape} is_multi={is_multi} "
+                f"History selection failed shape={history.shape} is_multi={history_is_multi} "
                 f"keys={keys_preview}"
             )
             return False
 
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index(level=0, drop=True, inplace=False)
+
+        df_is_multi = isinstance(df.index, pd.MultiIndex)
+
         first_ts = df.index.min() if len(df.index) else None
         last_ts = df.index.max() if len(df.index) else None
         self.debug(
-            f"History diagnostics shape={history.shape} is_multi={is_multi} "
-            f"keys={keys_preview} slice_first={first_ts} slice_last={last_ts}"
+            f"History diagnostics shape={history.shape} history_is_multi={history_is_multi} "
+            f"df_is_multi={df_is_multi} keys={keys_preview} "
+            f"slice_first={first_ts} slice_last={last_ts}"
         )
 
         today = self.time.date()
         by_day = {}
-        for t, row in df.iterrows():
-            d = t.date()
+        for idx, row in df.iterrows():
+            ts = idx[1] if isinstance(idx, tuple) else idx
+            d = ts.date()
             if d >= today:
                 continue
             close_px = float(row["close"])
